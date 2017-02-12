@@ -1,95 +1,187 @@
 # -*- coding: utf-8 -*-
 
 import sys
+import select
 import socket
+import logging
 import StringIO
+from datetime import datetime
+
+
+EOL1 = b'\n\n'
+EOL2 = b'\n\r\n'
+
+
+formatter = logging.Formatter(
+    '[%(levelname)1.1s %(asctime)s %(module)s:%(lineno)d] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S')
+stream_handler = logging.StreamHandler()
+stream_handler.formatter = formatter
+
+access_logger = logging.getLogger('zigmo_access')
+access_logger.addHandler(stream_handler)
+access_logger.setLevel(logging.INFO)
+
+
+class Connection(object):
+    def __init__(self, fd, connection, raw_request=b'', response=b''):
+        self.fd = fd
+        self.raw_request = raw_request
+        self.response = response
+        self.connection = connection
+        self.headers = None
+        self.status = None
+        self.send = False
+        self.address = None
 
 
 class WSGIServer(object):
-    address_family = socket.AF_INET
-    socket_type = socket.SOCK_STREAM
-    request_queue_size = 1
+    ADDRESS_FAMILY = socket.AF_INET
+    SOCKET_TYPE = socket.SOCK_STREAM
+    BACKLOG = 5
+
+    HEADER_DATE_FORMAT = '%a, %d %b %Y %H:%M:%S GMT'
+    SERVER_HEADER = ('Server', 'zigmo/WSGIServer 0.2')
 
     def __init__(self, server_address):
-        self.listen_socket = listen_socket = socket.socket(
-            self.address_family, self.socket_type,
+        self.ssocket = ssocket = socket.socket(
+            self.ADDRESS_FAMILY, self.SOCKET_TYPE,
         )
-        listen_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-        listen_socket.bind(server_address)
-        listen_socket.listen(self.request_queue_size)
-        host, port = listen_socket.getsockname()[:2]
+        ssocket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        ssocket.bind(server_address)
+        ssocket.listen(self.BACKLOG)
+        ssocket.setblocking(0)
+        host, port = ssocket.getsockname()[:2]
         self.server_name = socket.getfqdn(host)
         self.server_port = port
         self.headers_set = []
+
+        self.epoll = select.epoll()
+        self.epoll.register(ssocket.fileno(), select.EPOLLIN)
 
     def set_app(self, application):
         self.application = application
 
     def serve_forever(self):
-        listen_socket = self.listen_socket
-        while True:
-            self.client_connection, client_address = listen_socket.accept()
-            self.handle_one_request()
+        ssocket = self.ssocket
+        epoll = self.epoll
+        sfileno = ssocket.fileno()
 
-    def handle_one_request(self):
-        self.request_data = request_data = self.client_connection.recv(1024)
-        print ''.join(
+        pool = {}
+        try:
+            while True:
+                events = epoll.poll(1)
+                for fd, event in events:
+                    if fd == sfileno:
+                        connection, address = ssocket.accept()
+                        connection.setblocking(0)
+                        connection_fileno = connection.fileno()
+
+                        epoll.register(connection_fileno, select.EPOLLIN)
+
+                        conn = Connection(connection_fileno, connection)
+                        conn.address = address
+                        pool[connection_fileno] = conn
+                    elif event & select.EPOLLIN:
+                        conn = pool[fd]
+                        conn.raw_request += conn.connection.recv(1024)
+                        if EOL1 in conn.raw_request or EOL2 in conn.raw_request:
+                            epoll.modify(fd, select.EPOLLOUT)
+                    elif event & select.EPOLLOUT:
+                        conn = pool[fd]
+                        if not conn.send:
+                            self.handle(self.application, conn,
+                                        self.server_name, self.server_port)
+                        bytes = conn.connection.send(conn.response)
+                        conn.send = True
+                        conn.response = conn.response[bytes:]
+
+                        if len(conn.response) == 0:
+                            epoll.modify(fd, 0)
+                            conn.connection.shutdown(socket.SHUT_RDWR)
+                            conn.connection.close()
+                    elif event & select.EPOLLHUP:
+                        conn = pool[fd]
+                        epoll.unregister(fd)
+                        del pool[fd]
+                        del conn
+        finally:
+            epoll.unregister(ssocket.fileno())
+            epoll.close()
+            ssocket.close()
+
+    @classmethod
+    def handle(cls, application, connection, server_name, server_port):
+        def start_response(status, response_headers, exc_info=False):
+            connection.headers = response_headers + [
+                ('Date', datetime.utcnow().strftime(cls.HEADER_DATE_FORMAT)),
+                cls.SERVER_HEADER,
+            ]
+            connection.status = status
+
+        access_logger.debug('\n' + ''.join(
             '< {line}\n'.format(line=line)
-            for line in request_data.splitlines()
+            for line in connection.raw_request.splitlines()
+        ))
+        environ = cls.get_environ(
+            connection.raw_request, server_name, server_port
         )
-        self.parse_request(request_data)
-        env = self.get_environ()
-        result = self.application(env, self.start_response)
-        self.finish_response(result)
+        body = application(environ, start_response)
+        connection.response = cls.package_response(body, connection)
+        request_line = connection.raw_request.splitlines()[0]
+        access_logger.info(
+            '%s "%s" %s %s', connection.address[0], request_line,
+            connection.status.split(' ', 1)[0], len(body[0]),
+        )
 
-    def parse_request(self, text):
-        request_line = text.splitlines()[0]
-        request_line = request_line.rstrip('\r\n')
-        (
-            self.request_method,
-            self.path,
-            self.request_version
-        ) = request_line.split()
+    @classmethod
+    def parse_request(cls, content):
+        content_lines = content.splitlines()
 
-    def get_environ(self):
-        env = {
+        request_line = content_lines[0].rstrip('\r\n')
+        request_method, path, request_version = request_line.split()
+        if '?' in path:
+            path, query_string = path.split('?', 1)
+        else:
+            path, query_string = path, ''
+
+        return {
+            'PATH_INFO': path,
+            'REQUEST_METHOD': request_method,
+            'SERVER_PROTOCOL': request_version,
+            'QUERY_STRING': query_string,
+        }
+
+    @classmethod
+    def get_environ(cls, raw_request, server_name, server_port):
+        request_data = cls.parse_request(raw_request)
+        environ = {
             'wsgi.version': (1, 0),
-            'wsgi.url_scheme': 'http',
-            'wsgi.input': StringIO.StringIO(self.request_data),
+            'wsgi.url_scheme': request_data['SERVER_PROTOCOL'].split('/')[1].lower(),
+            'wsgi.input': StringIO.StringIO(raw_request),
             'wsgi.errors': sys.stderr,
             'wsgi.multithread': False,
             'wsgi.multiprocess': False,
             'wsgi.run_once': False,
-            'REQUEST_METHOD': self.request_method,
-            'PATH_INFO': self.path,
-            'SERVER_NAME': self.server_name,
-            'SERVER_PORT': self.server_port,
+            'SERVER_NAME': server_name,
+            'SERVER_PORT': server_port,
         }
-        return env
+        environ.update(request_data)
+        return environ
 
-    def start_response(self, status, response_headers, exc_info=None):
-        server_headers = [
-            ('Date', 'Sun, 12 Feb 2017 12:54:48 GMT'),
-            ('Server', 'WSGIServer demo 0.1'),
-        ]
-        self.headers_set = [status, response_headers + server_headers]
-
-    def finish_response(self, result):
-        try:
-            status, response_headers = self.headers_set
-            response = 'HTTP/1.1 {status}\r\n'.format(status=status)
-            for header in response_headers:
-                response += '{0}: {1}\r\n'.format(*header)
-            response += '\r\n'
-            for data in result:
-                response += data
-            print ''.join(
-                '> {line}\n'.format(line=line)
-                for line in response.splitlines()
-            )
-            self.client_connection.sendall(response)
-        finally:
-            self.client_connection.close()
+    @classmethod
+    def package_response(cls, body, connection):
+        response = 'HTTP/1.1 {status}\r\n'.format(status=connection.status)
+        for header in connection.headers:
+            response += '{0}: {1}\r\n'.format(*header)
+        response += '\r\n'
+        for data in body:
+            response += data
+        access_logger.debug('\n' + ''.join(
+            '> {line}\n'.format(line=line)
+            for line in response.splitlines()
+        ))
+        return response
 
 
 def make_server(host, port, application):
