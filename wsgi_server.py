@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 
 import sys
-import select
 import socket
 import logging
 import StringIO
 from datetime import datetime
+
+from ioloop import IOLoop
 
 
 EOL1 = b'\n\n'
@@ -24,75 +25,16 @@ access_logger.addHandler(stream_handler)
 access_logger.setLevel(logging.INFO)
 
 
-class IOLoop(object):
-    _EPOLLIN = 0x001
-    _EPOLLOUT = 0x004
-    _EPOLLERR = 0x008
-    _EPOLLHUP = 0x010
-
-    READ = _EPOLLIN
-    WRITE = _EPOLLOUT
-    ERROR = _EPOLLERR | _EPOLLHUP
-
-    PULL_TIMEOUT = 1
-
-    def __init__(self):
-        self.handlers = {}
-        self.events = {}
-        self.epoll = select.epoll()
-
-    @staticmethod
-    def instance():
-        if not hasattr(IOLoop, '_instance'):
-            IOLoop._instance = IOLoop()
-        return IOLoop._instance
-
-    def add_handler(self, fd_obj, callback, event):
-        fd = fd_obj.fileno()
-        self.handlers[fd] = (fd_obj, callback)
-        self.epoll.register(fd, event)
-
-    def update_handler(self, fd, event):
-        self.epoll.modify(fd, event)
-
-    def remove_handler(self, fd):
-        self.handlers.pop(fd, None)
-        try:
-            self.epoll.unregister(fd)
-        except Exception:
-            access_logger.error('epoll unregister failed %s', fd)
-
-    def update_callback(self, fd, callback):
-        self.handlers[fd] = (self.handlers[fd][0], callback)
-
-    def start(self):
-        try:
-            while True:
-                events = self.epoll.poll(self.PULL_TIMEOUT)
-                self.events.update(events)
-                while self.events:
-                    fd, event = self.events.popitem()
-                    try:
-                        fd_obj, callback = self.handlers[fd]
-                        callback(fd_obj, event)
-                    except Exception as error:
-                        access_logger.exception('ioloop callback error: %r', error)
-        finally:
-            for fd, _ in self.handlers.items():
-                self.remove_handler(fd)
-            self.epoll.close()
-
-
 class Connection(object):
     def __init__(self, fd):
         self.fd = fd
         self.request_buffer = []
-        self._handled = False
-        self._response = b''
+        self.handled = False
+        self.response = b''
 
-        self._headers = None
-        self._status = None
-        self._address = None
+        self.headers = None
+        self.status = None
+        self.address = None
 
 
 class WSGIServer(object):
@@ -134,7 +76,7 @@ class WSGIServer(object):
 
         fd = connect.fileno()
         connection = Connection(fd)
-        connection._address = addr
+        connection.address = addr
         self.conn_pool[fd] = connection
 
     def _receive(self, connect, event):
