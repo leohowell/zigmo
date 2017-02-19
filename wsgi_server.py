@@ -92,7 +92,7 @@ class WSGIServer(object):
         if EOL2 in last_fragment:
             ioloop = IOLoop.instance()
             ioloop.update_handler(fd, IOLoop.WRITE)
-            ioloop.update_callback(fd, self._send)
+            ioloop.replace_handler(fd, self._send)
 
     def _send(self, connect, event):
         if event & IOLoop.ERROR:

@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 
 from zigmo import Application, BaseHandler, run_server
+from concorrent import Return, coroutine
 
 
 class AppHandler(BaseHandler):
@@ -9,9 +10,23 @@ class AppHandler(BaseHandler):
         return "Marry Christmas"
 
 
+class AsyncHandler(BaseHandler):
+    @classmethod
+    @coroutine
+    def yield_something(cls):
+        raise Return('value from yield')
+
+    @classmethod
+    @coroutine
+    def get(cls, *args, **kwargs):
+        result = yield cls.yield_something()
+        raise Return(result)
+
+
 if __name__ == '__main__':
     app = Application([
         ('/app', AppHandler),
         ('/\d+', AppHandler),
+        ('/s', AsyncHandler),
     ])
-    run_server(application=app)
+    run_server('0.0.0.0', 8080, application=app)

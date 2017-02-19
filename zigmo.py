@@ -5,6 +5,7 @@ import urllib
 
 # from wsgiref.simple_server import make_server
 from wsgi_server import make_server
+from concorrent import Future
 
 
 _RESPONSE_STATUSES = {
@@ -307,6 +308,8 @@ class Application(object):
     @classmethod
     def execute_handler(cls, func, request, response):
         result = func(request=request, response=response)
+        if isinstance(result, Future):
+            return result.result
         return result
 
 
