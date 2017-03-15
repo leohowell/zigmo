@@ -53,9 +53,39 @@ class Runner(object):
         if self.handle_yield(first_yielded):
             self.run()
 
+    def multi_future(self, yielded):
+        children = yielded
+        future = Future()
+        if not children:
+            future.set_result([])
+
+        unfinished_children = set(children)
+
+        def callback(f):
+            unfinished_children.remove(f)
+            if not unfinished_children:
+                result_list = []
+                for f in children:
+                    try:
+                        result_list.append(f.result)
+                    except Exception as e:
+                        print 'multi future error:%r' % e
+                if not future.done:
+                    future.set_result(result_list)
+
+        listening = set()
+        for f in children:
+            if f not in listening:
+                listening.add(f)
+                f.add_done_callback(callback)
+        return future
+
     def handle_yield(self, yielded):
-        # yielded is definitely Future
-        self.future = yielded
+        if isinstance(yielded, (list, dict)):
+            self.future = self.multi_future(yielded)
+        else:
+            self.future = yielded
+
         if not self.future.done:
             self.ioloop.add_future(self.future, lambda f: self.run())
             return False
