@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 from zigmo import Application, BaseHandler, run_server
-from concorrent import Return, coroutine
+from concurrent import Return, coroutine
 
 
 class AppHandler(BaseHandler):
